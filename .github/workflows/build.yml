@@ -1,13 +1,10 @@
 name: build
 
-# 背景（实测结论）：
-#   * 本账号 macOS runner 不可用（job 创建即 cancelled，runner 从未分配）
-#   * ubuntu-latest runner 正常
-#   * Zig 自带的 lld 在「多个 .m 各自带 __objc_classlist / __objc_data」时只保留一份，
-#     导致自定义 ObjC 类变成 undef 符号 → dyld 加载即崩（上一版实测：classlist 只有 2 个类，
-#     而 _OBJC_CLASS_$_VCamLANHTTPFLVPuller / _OBJC_CLASS_$_VCamLANButtonTarget 全是 undef）
-#   * 所以改用标准 clang + LLVM 官方 ld64.lld（Mach-O 链接器，ObjC synthetic section 合并正确）
-#   * 编译后强制自检：ObjC 类必须全部 defined，classlist 条目数 == 源码类数
+# 背景（实测）：
+#   * macOS runner 不可用（创建即 cancelled），ubuntu runner 正常
+#   * Zig 的 lld 编多文件 ObjC 会丢类（classlist 只剩 2 个、类成 undef）→ dyld 崩
+#   * 需要标准的 ld64.lld（LLVM Mach-O 链接器）
+# 本文件对 ld64.lld 做多重探测 + 详细打印，确保能定位到底缺什么
 
 on:
   push:
@@ -18,9 +15,9 @@ on:
 
 jobs:
   build:
-    name: Build VCamLAN.dylib (clang + ld64.lld)
+    name: Build VCamLAN.dylib
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -30,33 +27,71 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang lld llvm python3
-          echo "=== 系统 lld 内容 ==="
-          ls -1 /usr/lib/llvm-*/bin/ 2>/dev/null | grep -E '^ld' || true
-          find /usr -name 'ld64.lld*' 2>/dev/null | head || true
-          clang --version | head -n 2
+          sudo apt-get install -y --no-install-recommends clang lld llvm python3 xz-utils
+          echo "=== clang ==="; clang --version | head -n 3
+          echo "=== /usr/lib/llvm-*/bin (只看 ld*) ==="
+          for d in /usr/lib/llvm-*/bin; do [ -d "$d" ] && { echo "--- $d"; ls -la "$d" | grep -Ei '\bld|ld64|lld' || echo "(none)"; }; done
+          echo "=== /usr/bin (ld*) ==="
+          ls -la /usr/bin/ | grep -E ' ld|lld' || echo "(none)"
 
-      - name: Ensure ld64.lld (download LLVM release if apt lacks it)
+      - name: Locate or install ld64.lld
         run: |
           set -euo pipefail
-          LD64="$(find /usr -name 'ld64.lld' -type f 2>/dev/null | head -n1 || true)"
+          find_ld64() {
+            for c in /usr/lib/llvm-*/bin/ld64.lld /usr/bin/ld64.lld /usr/local/bin/ld64.lld; do
+              [ -x "$c" ] && { echo "$c"; return 0; }
+            done
+            return 1
+          }
+          LD64="$(find_ld64 || true)"
+          CLANG="$(command -v clang)"
+
           if [ -z "$LD64" ]; then
-            echo "apt 的 lld 不含 ld64.lld，下载 LLVM 官方包"
-            curl -fL --retry 3 -o /tmp/llvm.tar.xz \
-              https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz
-            mkdir -p /opt/llvm
-            tar -xf /tmp/llvm.tar.xz -C /opt/llvm --strip-components=1
-            LD64="/opt/llvm/bin/ld64.lld"
-            CLANG="/opt/llvm/bin/clang"
-          else
-            CLANG="$(command -v clang)"
+            echo ">>> apt 没有 ld64.lld，试着补装 lld-18 / lld-17"
+            sudo apt-get install -y --no-install-recommends lld-18 lld-17 2>/dev/null || true
+            LD64="$(find_ld64 || true)"
           fi
-          [ -x "$LD64" ] || { echo "!! 仍然没有 ld64.lld"; exit 1; }
-          chmod +x "$LD64" || true
-          echo "LD64=$LD64"   >> "$GITHUB_ENV"
-          echo "CC1=$CLANG"   >> "$GITHUB_ENV"
-          "$LD64" --version || true
+
+          if [ -z "$LD64" ]; then
+            echo ">>> 仍然没有，下载 LLVM 官方预编译包"
+            for URL in \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz" \
+              "https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.6/clang+llvm-16.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz" ; do
+              echo "--- try $URL"
+              if curl -fL --retry 2 --connect-timeout 20 -o /tmp/llvm.tar.xz "$URL"; then
+                echo "    downloaded $(stat -c %s /tmp/llvm.tar.xz) bytes"
+                rm -rf /opt/llvm; mkdir -p /opt/llvm
+                if tar -xf /tmp/llvm.tar.xz -C /opt/llvm --strip-components=1; then
+                  echo "    extracted. bin 里有哪些 ld*:"
+                  ls -la /opt/llvm/bin/ | grep -Ei 'ld|lld' || echo "    (没有)"
+                  if [ -x /opt/llvm/bin/ld64.lld ]; then
+                    LD64=/opt/llvm/bin/ld64.lld
+                    CLANG=/opt/llvm/bin/clang
+                    break
+                  fi
+                else
+                  echo "    tar 解压失败"
+                fi
+              else
+                echo "    下载失败"
+              fi
+            done
+          fi
+
+          if [ -z "$LD64" ]; then
+            echo "!! 所有途径都拿不到 ld64.lld"
+            echo "== 全盘搜索（慢，仅失败时跑）=="
+            find / -name 'ld64*' -o -name 'ld.lld*' 2>/dev/null | head -n 30 || true
+            exit 1
+          fi
+
+          echo "LD64=$LD64" >> "$GITHUB_ENV"
+          echo "CC1=$CLANG" >> "$GITHUB_ENV"
+          echo ">>> 使用 LD64 = $LD64"
+          echo ">>> 使用 CC   = $CLANG"
           "$CLANG" --version | head -n 2
+          "$LD64" --version || true
 
       - name: Install iOS SDK
         run: |
@@ -67,11 +102,9 @@ jobs:
           tar -xzf /tmp/sdks.tar.gz -C /tmp/sdks --strip-components=1
           pick=""
           for cand in iPhoneOS15.6.sdk iPhoneOS14.5.sdk iPhoneOS16.5.sdk iPhoneOS15.0.sdk iPhoneOS14.4.sdk; do
-            if [ -d "/tmp/sdks/$cand" ]; then pick="/tmp/sdks/$cand"; break; fi
+            [ -d "/tmp/sdks/$cand" ] && { pick="/tmp/sdks/$cand"; break; }
           done
-          if [ -z "$pick" ]; then
-            pick=$(ls -d /tmp/sdks/iPhoneOS*.sdk 2>/dev/null | sort -V | tail -n 1)
-          fi
+          if [ -z "$pick" ]; then pick=$(ls -d /tmp/sdks/iPhoneOS*.sdk 2>/dev/null | sort -V | tail -n 1); fi
           [ -n "$pick" ] || { echo "no sdk"; ls -la /tmp/sdks; exit 1; }
           echo "SDK=$pick" >> "$GITHUB_ENV"
           echo "SDK = $pick"
@@ -85,97 +118,63 @@ jobs:
             -isysroot "$SDK" \
             -F"$SDK/System/Library/Frameworks" \
             -L"$SDK/usr/lib" \
-            -fobjc-arc \
-            -O2 -DNDEBUG \
-            -I. \
-            -fno-stack-protector \
+            -fobjc-arc -O2 -DNDEBUG -I. -fno-stack-protector \
             --ld-path="$LD64" \
-            -dynamiclib \
-            -install_name @rpath/VCamLAN.dylib \
+            -dynamiclib -install_name @rpath/VCamLAN.dylib \
             -o VCamLAN.dylib \
             VCamLANMain.m VCamLANPrefs.m VCamLANHTTPFLVPuller.m \
             -framework Foundation -framework UIKit \
             -framework AVFoundation -framework CoreMedia \
             -framework CoreVideo -framework VideoToolbox \
-            -framework QuartzCore -framework CoreGraphics \
-            2>&1 | tail -n 80
+            -framework QuartzCore -framework CoreGraphics 2>&1 | tail -n 60
           ls -la VCamLAN.dylib
 
-      - name: STRICT self-check (ObjC classes must be defined)
+      - name: STRICT self-check
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import struct, sys
-
           d = open('VCamLAN.dylib','rb').read()
           magic, cpu, sub, ft, ncmds, sizeofcmds, flags, _ = struct.unpack_from('<IiiIIIII', d, 0)
-          print("magic=%08x cputype=%x filetype=%d ncmds=%d" % (magic, cpu & 0xffffffff, ft, ncmds))
-          assert magic == 0xfeedfacf, "不是 64 位 Mach-O"
-          assert cpu & 0xffffffff == 0x0100000c, "不是 arm64"
-          assert ft == 6, "不是 MH_DYLIB"
-
-          off = 32
-          symtab = dysym = None
-          classlist_size = None
-          dylibs = []
+          print("magic=%08x cpu=%x filetype=%d ncmds=%d size=%d" % (magic, cpu & 0xffffffff, ft, ncmds, len(d)))
+          assert magic == 0xfeedfacf and (cpu & 0xffffffff) == 0x0100000c and ft == 6
+          off, symtab, dysym, classlist_size, dylibs = 32, None, None, None, []
           for _ in range(ncmds):
               cmd, cmdsize = struct.unpack_from('<II', d, off)
               if cmd == 0x19:
-                  seg = d[off+8:off+24].rstrip(b'\x00').decode()
                   nsec = struct.unpack_from('<I', d, off+64)[0]
                   soff = off + 72
                   for _s in range(nsec):
                       secname = d[soff:soff+16].rstrip(b'\x00').decode()
-                      size = struct.unpack_from('<Q', d, soff+40)[0]
                       if secname == '__objc_classlist':
-                          classlist_size = size
+                          classlist_size = struct.unpack_from('<Q', d, soff+40)[0]
                       soff += 80
-              elif cmd == 0x2:
-                  symtab = struct.unpack_from('<IIII', d, off+8)
-              elif cmd == 0xb:
-                  dysym = struct.unpack_from('<IIIIIIIIIIIIIIIIIIII', d, off+8)
+              elif cmd == 0x2: symtab = struct.unpack_from('<IIII', d, off+8)
+              elif cmd == 0xb: dysym = struct.unpack_from('<IIIIIIIIIIIIIIIIIIII', d, off+8)
               elif cmd in (0xc, 0x1f, 0x8000001f):
-                  no = struct.unpack_from('<I', d, off+8)[0]
-                  end = d.index(b'\x00', off+no)
+                  no = struct.unpack_from('<I', d, off+8)[0]; end = d.index(b'\x00', off+no)
                   dylibs.append(d[off+no:end].decode('utf-8','replace'))
               off += cmdsize
-
-          nclasses = (classlist_size or 0) // 8
-          print("__objc_classlist 条目数 =", nclasses)
-
-          assert symtab and dysym, "缺 symtab"
+          nclasses = (classlist_size or 0)//8
+          print("__objc_classlist 条目 =", nclasses)
           symoff, nsyms, stroff, strsize = symtab
-          undef_objc = []
+          print("nextdefsym=%d nundefsym=%d" % (dysym[3], dysym[4]))
+          undef = []
           for i in range(nsyms):
               e = symoff + i*16
               strx, ntype, nsect, ndesc, nvalue = struct.unpack_from('<IBBhQ', d, e)
-              if (ntype & 0x0e) == 0x00:
+              if (ntype & 0x0e) == 0:
                   end = d.index(b'\x00', stroff+strx)
                   nm = d[stroff+strx:end].decode('utf-8','replace')
                   if nm.startswith('_OBJC_CLASS_$_') or nm.startswith('_OBJC_METACLASS_$_'):
-                      undef_objc.append(nm)
-          print("未定义 ObjC 类符号 =", len(undef_objc))
-          for nm in undef_objc[:10]:
-              print("   !!", nm)
-
+                      undef.append(nm)
+          print("未定义 ObjC 类 =", len(undef), undef[:8])
           for nm in dylibs:
-              if 'substrate' in nm.lower():
-                  print("!! 依赖 substrate:", nm); sys.exit(1)
-
-          if undef_objc:
-              print("FAIL: 自定义 ObjC 类没被定义（链接器丢失 ObjC section）")
-              sys.exit(1)
-          if nclasses < 3:
-              print("FAIL: classlist 只有 %d 个类，源码里有 3 个" % nclasses)
-              sys.exit(1)
-          print("PASS: 类定义完整，无未定义 ObjC 符号，无 substrate 依赖")
+              if 'substrate' in nm.lower(): print("!! substrate:", nm); sys.exit(1)
+          assert not undef, "ObjC 类成了未定义符号（链接器丢了 ObjC section）"
+          assert nclasses >= 3, "classlist 只有 %d 个类" % nclasses
+          print("PASS")
           PY
-
-      - name: Inspect
-        run: |
-          set -euo pipefail
-          file VCamLAN.dylib || true
-          stat -c '%s bytes' VCamLAN.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
