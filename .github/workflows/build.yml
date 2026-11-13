@@ -1,12 +1,13 @@
 name: build
 
-# 背景：
-#   1) 本账号的 macOS runner 不可用（job 创建即 cancelled，runner 从未分配），已用 probe workflow 实测：
-#        on_ubuntu = success（runner 正常），on_macos = cancelled
-#   2) Ubuntu runner 正常，所以改用 Linux 交叉编译 Mach-O dylib。
-#   3) Theos 在 Linux 上需要 $THEOS/toolchain/linux/iphone/bin/clang（本环境不存在），
-#      所以直接用 Zig 自带的 clang 驱动 + 内置 lld（支持 Mach-O 链接），配合 iOS SDK 的 .tbd 存根。
-#   4) 签名跳过：TrollFools 注入不需要签名。
+# 背景（实测结论）：
+#   * 本账号 macOS runner 不可用（job 创建即 cancelled，runner 从未分配）
+#   * ubuntu-latest runner 正常
+#   * Zig 自带的 lld 在「多个 .m 各自带 __objc_classlist / __objc_data」时只保留一份，
+#     导致自定义 ObjC 类变成 undef 符号 → dyld 加载即崩（上一版实测：classlist 只有 2 个类，
+#     而 _OBJC_CLASS_$_VCamLANHTTPFLVPuller / _OBJC_CLASS_$_VCamLANButtonTarget 全是 undef）
+#   * 所以改用标准 clang + LLVM 官方 ld64.lld（Mach-O 链接器，ObjC synthetic section 合并正确）
+#   * 编译后强制自检：ObjC 类必须全部 defined，classlist 条目数 == 源码类数
 
 on:
   push:
@@ -17,7 +18,7 @@ on:
 
 jobs:
   build:
-    name: Build VCamLAN.dylib (linux + zig)
+    name: Build VCamLAN.dylib (clang + ld64.lld)
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -25,15 +26,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Zig (自带 clang + Mach-O lld)
+      - name: Install clang + lld
         run: |
           set -euo pipefail
-          curl -fL --retry 3 -o /tmp/zig.tar.xz \
-            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /opt
-          ln -sf /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
-          zig version
-          zig env | head -n 20
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm python3
+          echo "=== 系统 lld 内容 ==="
+          ls -1 /usr/lib/llvm-*/bin/ 2>/dev/null | grep -E '^ld' || true
+          find /usr -name 'ld64.lld*' 2>/dev/null | head || true
+          clang --version | head -n 2
+
+      - name: Ensure ld64.lld (download LLVM release if apt lacks it)
+        run: |
+          set -euo pipefail
+          LD64="$(find /usr -name 'ld64.lld' -type f 2>/dev/null | head -n1 || true)"
+          if [ -z "$LD64" ]; then
+            echo "apt 的 lld 不含 ld64.lld，下载 LLVM 官方包"
+            curl -fL --retry 3 -o /tmp/llvm.tar.xz \
+              https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+            mkdir -p /opt/llvm
+            tar -xf /tmp/llvm.tar.xz -C /opt/llvm --strip-components=1
+            LD64="/opt/llvm/bin/ld64.lld"
+            CLANG="/opt/llvm/bin/clang"
+          else
+            CLANG="$(command -v clang)"
+          fi
+          [ -x "$LD64" ] || { echo "!! 仍然没有 ld64.lld"; exit 1; }
+          chmod +x "$LD64" || true
+          echo "LD64=$LD64"   >> "$GITHUB_ENV"
+          echo "CC1=$CLANG"   >> "$GITHUB_ENV"
+          "$LD64" --version || true
+          "$CLANG" --version | head -n 2
 
       - name: Install iOS SDK
         run: |
@@ -49,68 +72,110 @@ jobs:
           if [ -z "$pick" ]; then
             pick=$(ls -d /tmp/sdks/iPhoneOS*.sdk 2>/dev/null | sort -V | tail -n 1)
           fi
-          if [ -z "$pick" ]; then echo "!! 没找到 SDK"; ls -la /tmp/sdks; exit 1; fi
-          echo "SDK = $pick"
+          [ -n "$pick" ] || { echo "no sdk"; ls -la /tmp/sdks; exit 1; }
           echo "SDK=$pick" >> "$GITHUB_ENV"
-          ls "$pick" | head -n 20
+          echo "SDK = $pick"
 
-      - name: Build with Zig (arm64)
+      - name: Build
         run: |
           set -euo pipefail
-          echo "=== SDK=$SDK ==="
-          mkdir -p out
-          CFLAGS=(
-            -target aarch64-ios
-            -isysroot "$SDK"
-            -F"$SDK/System/Library/Frameworks"
-            -L"$SDK/usr/lib"
-            -I"$SDK/usr/include"
-            -fobjc-arc
-            -O2
-            -DNDEBUG
-            -I.
-            -Wno-everything
-            -fno-stack-protector
-          )
-          LIBS=(
-            -framework Foundation
-            -framework UIKit
-            -framework AVFoundation
-            -framework CoreMedia
-            -framework CoreVideo
-            -framework VideoToolbox
-            -framework QuartzCore
-            -framework CoreGraphics
-          )
-          set -x
-          zig cc "${CFLAGS[@]}" -dynamiclib \
+          echo "CC1=$CC1  LD64=$LD64  SDK=$SDK"
+          "$CC1" \
+            -target arm64-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -F"$SDK/System/Library/Frameworks" \
+            -L"$SDK/usr/lib" \
+            -fobjc-arc \
+            -O2 -DNDEBUG \
+            -I. \
+            -fno-stack-protector \
+            --ld-path="$LD64" \
+            -dynamiclib \
             -install_name @rpath/VCamLAN.dylib \
             -o VCamLAN.dylib \
             VCamLANMain.m VCamLANPrefs.m VCamLANHTTPFLVPuller.m \
-            "${LIBS[@]}" 2>&1 | tee /tmp/build.log | tail -n 100
-          set +x
-          echo "=== exit=${PIPESTATUS[0]} ==="
-          ls -la VCamLAN.dylib 2>/dev/null || (echo "!! 没有产物，完整日志见下"; cat /tmp/build.log; exit 1)
+            -framework Foundation -framework UIKit \
+            -framework AVFoundation -framework CoreMedia \
+            -framework CoreVideo -framework VideoToolbox \
+            -framework QuartzCore -framework CoreGraphics \
+            2>&1 | tail -n 80
+          ls -la VCamLAN.dylib
 
-      - name: Inspect output
+      - name: STRICT self-check (ObjC classes must be defined)
         run: |
           set -euo pipefail
-          if [ ! -f VCamLAN.dylib ]; then echo "!! 没产出"; exit 1; fi
-          file VCamLAN.dylib || true
-          stat -c '%s bytes' VCamLAN.dylib
           python3 - <<'PY'
           import struct, sys
+
           d = open('VCamLAN.dylib','rb').read()
-          print("magic:", d[:4].hex())
-          if d[:4] == b'\xcf\xfa\xed\xfe':
-              cpu, sub, ft, ncmds, sizeofcmds, flags = struct.unpack_from('<iiIIII', d, 4)
-              print("cputype=0x%x cpusubtype=0x%x filetype=%d ncmds=%d flags=0x%x" % (cpu, sub, ft, ncmds, flags))
-              if cpu != 0x100000c: print("!! cputype 不是 arm64")
-              if ft != 6: print("!! filetype 不是 MH_DYLIB(6)")
-              print("OK: 是 arm64 Mach-O dylib")
-          else:
-              print("!! 不是 Mach-O"); sys.exit(1)
+          magic, cpu, sub, ft, ncmds, sizeofcmds, flags, _ = struct.unpack_from('<IiiIIIII', d, 0)
+          print("magic=%08x cputype=%x filetype=%d ncmds=%d" % (magic, cpu & 0xffffffff, ft, ncmds))
+          assert magic == 0xfeedfacf, "不是 64 位 Mach-O"
+          assert cpu & 0xffffffff == 0x0100000c, "不是 arm64"
+          assert ft == 6, "不是 MH_DYLIB"
+
+          off = 32
+          symtab = dysym = None
+          classlist_size = None
+          dylibs = []
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from('<II', d, off)
+              if cmd == 0x19:
+                  seg = d[off+8:off+24].rstrip(b'\x00').decode()
+                  nsec = struct.unpack_from('<I', d, off+64)[0]
+                  soff = off + 72
+                  for _s in range(nsec):
+                      secname = d[soff:soff+16].rstrip(b'\x00').decode()
+                      size = struct.unpack_from('<Q', d, soff+40)[0]
+                      if secname == '__objc_classlist':
+                          classlist_size = size
+                      soff += 80
+              elif cmd == 0x2:
+                  symtab = struct.unpack_from('<IIII', d, off+8)
+              elif cmd == 0xb:
+                  dysym = struct.unpack_from('<IIIIIIIIIIIIIIIIIIII', d, off+8)
+              elif cmd in (0xc, 0x1f, 0x8000001f):
+                  no = struct.unpack_from('<I', d, off+8)[0]
+                  end = d.index(b'\x00', off+no)
+                  dylibs.append(d[off+no:end].decode('utf-8','replace'))
+              off += cmdsize
+
+          nclasses = (classlist_size or 0) // 8
+          print("__objc_classlist 条目数 =", nclasses)
+
+          assert symtab and dysym, "缺 symtab"
+          symoff, nsyms, stroff, strsize = symtab
+          undef_objc = []
+          for i in range(nsyms):
+              e = symoff + i*16
+              strx, ntype, nsect, ndesc, nvalue = struct.unpack_from('<IBBhQ', d, e)
+              if (ntype & 0x0e) == 0x00:
+                  end = d.index(b'\x00', stroff+strx)
+                  nm = d[stroff+strx:end].decode('utf-8','replace')
+                  if nm.startswith('_OBJC_CLASS_$_') or nm.startswith('_OBJC_METACLASS_$_'):
+                      undef_objc.append(nm)
+          print("未定义 ObjC 类符号 =", len(undef_objc))
+          for nm in undef_objc[:10]:
+              print("   !!", nm)
+
+          for nm in dylibs:
+              if 'substrate' in nm.lower():
+                  print("!! 依赖 substrate:", nm); sys.exit(1)
+
+          if undef_objc:
+              print("FAIL: 自定义 ObjC 类没被定义（链接器丢失 ObjC section）")
+              sys.exit(1)
+          if nclasses < 3:
+              print("FAIL: classlist 只有 %d 个类，源码里有 3 个" % nclasses)
+              sys.exit(1)
+          print("PASS: 类定义完整，无未定义 ObjC 符号，无 substrate 依赖")
           PY
+
+      - name: Inspect
+        run: |
+          set -euo pipefail
+          file VCamLAN.dylib || true
+          stat -c '%s bytes' VCamLAN.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
