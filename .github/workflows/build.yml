@@ -1,4 +1,4 @@
-﻿name: build
+name: build
 
 # 背景（实测）：
 #   * macOS runner 不可用（创建即 cancelled），ubuntu runner 正常
@@ -174,13 +174,14 @@ jobs:
               if (ntype & 0x0e) == 0:
                   end = d.index(b'\x00', stroff+strx)
                   nm = d[stroff+strx:end].decode('utf-8','replace')
-                  if nm.startswith('_OBJC_CLASS_$_') or nm.startswith('_OBJC_METACLASS_$_'):
+                  # 只把本工程自己定义的类算作错误；NS*/UI*/VT* 等系统类本来就该是 undef
+                  if (nm.startswith('_OBJC_CLASS_$_') or nm.startswith('_OBJC_METACLASS_$_')) and 'VCamLAN' in nm:
                       undef.append(nm)
           print("未定义 ObjC 类 =", len(undef), undef[:8])
           for nm in dylibs:
               if 'substrate' in nm.lower(): print("!! substrate:", nm); sys.exit(1)
-          assert not undef, "ObjC 类成了未定义符号（链接器丢了 ObjC section）"
-          assert nclasses >= 3, "classlist 只有 %d 个类" % nclasses
+          assert not undef, "本工程自己的 ObjC 类成了未定义符号（链接器丢了 ObjC section）：%r" % undef
+          assert nclasses >= 2, "classlist 只有 %d 个类（应为 2 个：VCamLANHTTPFLVPuller / VCamLANButtonTarget）" % nclasses
           print("PASS")
           PY
 
