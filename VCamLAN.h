@@ -23,6 +23,14 @@
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 
+// 运行时取类 / 调用工具（对 Cam 的类零符号引用，见该头文件顶部说明）
+#import "VCamLANRuntime.h"
+
+// 本工程新增类
+#import "VCamLANHTTPFLVPuller.h"
+
+// 注意：#import 必须放在 NS_ASSUME_NONNULL_BEGIN 之前，
+// 否则 clang 报 "cannot #include files inside '#pragma clang assume_nonnull'"
 NS_ASSUME_NONNULL_BEGIN
 
 @class VCamStreamConfig;
@@ -33,12 +41,6 @@ NS_ASSUME_NONNULL_BEGIN
 @class VCamAACDecoder;
 @class VCamHTTPFLVPuller;
 @class VCamLANHTTPFLVPuller;
-
-// 运行时取类 / 调用工具（对 Cam 的类零符号引用，见该头文件顶部说明）
-#import "VCamLANRuntime.h"
-
-// 本工程新增类
-#import "VCamLANHTTPFLVPuller.h"
 
 // ==================================================================
 // VCamStreamConfig : NSObject   instanceStart=0x8 instanceSize=0x48
