@@ -1,0 +1,98 @@
+name: build
+
+# 用户不会本地编译，所以整条链路都放在云上跑：
+#   推送 / 手动点按钮 → 装 Theos + SDK → make → 把 VCamLAN.dylib 挂成 artifact
+# 全程零人工干预，产物在 Actions 运行页底部的 Artifacts 里下载。
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build VCamLAN.dylib
+    runs-on: macos-14
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          brew install ldid xz || true
+
+      - name: Install Theos
+        run: |
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          if [ ! -d "$THEOS" ]; then
+            git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          fi
+          mkdir -p "$THEOS/sdks"
+          ls "$THEOS/makefiles" >/dev/null
+          echo "Theos OK: $(ls "$THEOS" | tr '\n' ' ')"
+
+      - name: Install iOS SDK (theos/sdks)
+        run: |
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          curl -fL --retry 3 --retry-delay 2 -o /tmp/sdks.tar.gz \
+            https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
+          mkdir -p /tmp/sdks
+          tar -xzf /tmp/sdks.tar.gz -C /tmp/sdks --strip-components=1
+          pick=""
+          for cand in iPhoneOS15.6.sdk iPhoneOS14.5.sdk iPhoneOS16.5.sdk iPhoneOS15.0.sdk; do
+            if [ -d "/tmp/sdks/$cand" ]; then pick="/tmp/sdks/$cand"; break; fi
+          done
+          if [ -z "$pick" ]; then
+            pick=$(ls -d /tmp/sdks/iPhoneOS*.sdk 2>/dev/null | sort -V | tail -n 1)
+          fi
+          if [ -z "$pick" ]; then echo "没找到任何 iPhoneOS*.sdk，中止"; ls -la /tmp/sdks; exit 1; fi
+          echo "选用 SDK: $pick"
+          cp -R "$pick" "$THEOS/sdks/"
+          ls -la "$THEOS/sdks"
+
+      - name: Show environment
+        run: |
+          set -euo pipefail
+          echo "THEOS=$THEOS"
+          xcodebuild -version || true
+          make --version | head -n 1
+          clang --version | head -n 2
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          make clean || true
+          make -j"$(sysctl -n hw.ncpu)" all
+          ls -la .
+          file VCamLAN.dylib || true
+
+      - name: Verify no substrate symbol
+        run: |
+          set -euo pipefail
+          if otool -L VCamLAN.dylib | grep -qi substrate; then
+            echo "!! 产物依赖 substrate，TrollStore 下会加载失败"; exit 1
+          fi
+          echo "== LC_LOAD_DYLIB =="
+          otool -L VCamLAN.dylib
+          echo "== 架构 =="
+          lipo -info VCamLAN.dylib || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCamLAN.dylib
+          path: |
+            VCamLAN.dylib
+            .theos/obj/**/VCamLAN.dylib
+          if-no-files-found: error
+          retention-days: 30
