@@ -1,4 +1,4 @@
-name: build
+﻿name: build
 
 # 背景（实测）：
 #   * macOS runner 不可用（创建即 cancelled），ubuntu runner 正常
@@ -45,6 +45,13 @@ jobs:
           }
           LD64="$(find_ld64 || true)"
           CLANG="$(command -v clang)"
+          if [ -n "$LD64" ]; then
+            SAME_DIR="$(dirname "$LD64")/clang"
+            if [ -x "$SAME_DIR" ]; then
+              CLANG="$SAME_DIR"
+              echo ">>> 用与 ld64.lld 同目录的 clang：$CLANG（版本匹配）"
+            fi
+          fi
 
           if [ -z "$LD64" ]; then
             echo ">>> apt 没有 ld64.lld，试着补装 lld-18 / lld-17"
@@ -120,6 +127,7 @@ jobs:
             -L"$SDK/usr/lib" \
             -fobjc-arc -O2 -DNDEBUG -I. -fno-stack-protector \
             --ld-path="$LD64" \
+            -Wl,-platform_version -Wl,ios -Wl,14.0 -Wl,15.6 \
             -dynamiclib -install_name @rpath/VCamLAN.dylib \
             -o VCamLAN.dylib \
             VCamLANMain.m VCamLANPrefs.m VCamLANHTTPFLVPuller.m \
