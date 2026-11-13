@@ -1,9 +1,12 @@
 name: build
 
-# 说明：这台账号的 macOS runner 不可用（job 一创建就被 cancelled，runner 从未分配），
-# 但 ubuntu-latest runner 可用（已实测 on_ubuntu=success）。
-# 所以改用 Linux 交叉编译 Mach-O dylib：clang -target arm64-apple-ios + iOS SDK(tbd)。
-# Theos 只用来提供 makefile 规则；签名跳过（TrollFools 注入不需要签名）。
+# 背景：
+#   1) 本账号的 macOS runner 不可用（job 创建即 cancelled，runner 从未分配），已用 probe workflow 实测：
+#        on_ubuntu = success（runner 正常），on_macos = cancelled
+#   2) Ubuntu runner 正常，所以改用 Linux 交叉编译 Mach-O dylib。
+#   3) Theos 在 Linux 上需要 $THEOS/toolchain/linux/iphone/bin/clang（本环境不存在），
+#      所以直接用 Zig 自带的 clang 驱动 + 内置 lld（支持 Mach-O 链接），配合 iOS SDK 的 .tbd 存根。
+#   4) 签名跳过：TrollFools 注入不需要签名。
 
 on:
   push:
@@ -14,7 +17,7 @@ on:
 
 jobs:
   build:
-    name: Build VCamLAN.dylib (linux cross)
+    name: Build VCamLAN.dylib (linux + zig)
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -22,48 +25,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Install Zig (自带 clang + Mach-O lld)
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld make git curl xz-utils ca-certificates \
-            libplist-dev libssl-dev zlib1g-dev
-          echo "--- versions ---"
-          clang --version | head -n 2
-          ld64.lld --version 2>/dev/null || echo "(ld64.lld 未随 lld 提供，稍后会用 theos 自带的)"
-          ls -l /usr/bin/ld64.lld 2>/dev/null || true
-
-      - name: Install ldid
-        run: |
-          set -euo pipefail
-          if sudo apt-get install -y ldid 2>/dev/null && command -v ldid; then
-            echo "ldid from apt: $(command -v ldid)"
-          else
-            echo "apt 没有 ldid，改用 theos 自带"
-          fi
-
-      - name: Install Theos
-        run: |
-          set -euo pipefail
-          export THEOS="$HOME/theos"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS" || \
-            git clone --depth 1 https://github.com/theos/theos.git "$THEOS"
-          mkdir -p "$THEOS/sdks"
-          ls "$THEOS" | tr '\n' ' '; echo
-          ls "$THEOS/toolchain" 2>/dev/null || echo "(no toolchain dir)"
-          ls "$THEOS/makefiles" 2>/dev/null | head
+          curl -fL --retry 3 -o /tmp/zig.tar.xz \
+            https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /opt
+          ln -sf /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+          zig version
+          zig env | head -n 20
 
       - name: Install iOS SDK
         run: |
           set -euo pipefail
-          export THEOS="$HOME/theos"
           curl -fL --retry 3 --retry-delay 2 -o /tmp/sdks.tar.gz \
             https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
           mkdir -p /tmp/sdks
           tar -xzf /tmp/sdks.tar.gz -C /tmp/sdks --strip-components=1
-          ls /tmp/sdks | head -n 30
           pick=""
           for cand in iPhoneOS15.6.sdk iPhoneOS14.5.sdk iPhoneOS16.5.sdk iPhoneOS15.0.sdk iPhoneOS14.4.sdk; do
             if [ -d "/tmp/sdks/$cand" ]; then pick="/tmp/sdks/$cand"; break; fi
@@ -73,57 +51,68 @@ jobs:
           fi
           if [ -z "$pick" ]; then echo "!! 没找到 SDK"; ls -la /tmp/sdks; exit 1; fi
           echo "SDK = $pick"
-          cp -R "$pick" "$THEOS/sdks/"
-          echo "SDK_NAME=$(basename "$pick")" >> "$GITHUB_ENV"
-          ls "$THEOS/sdks"
+          echo "SDK=$pick" >> "$GITHUB_ENV"
+          ls "$pick" | head -n 20
 
-      # 方案 1：先用 Theos 走一遍（Linux 上 Theos 官方支持，靠 clang + 自带 ld64）
-      - name: Build with Theos
-        continue-on-error: true
+      - name: Build with Zig (arm64)
         run: |
           set -euo pipefail
-          export THEOS="$HOME/theos"
-          export PATH="$THEOS/bin:$PATH"
-          make clean || true
-          make -j"$(nproc)" all 2>&1 | tail -n 60
-          ls -la
-
-      # 方案 2：如果 Theos 不行，直接 clang 手编 Mach-O
-      - name: Fallback direct clang build
-        if: ${{ !hashFiles('VCamLAN.dylib') }}
-        run: |
-          set -euo pipefail
-          export SDK="$HOME/theos/sdks/$SDK_NAME"
-          echo "SDK=$SDK"
-          ls "$SDK" | head
-          CFLAGS="-target arm64-apple-ios14.0 -isysroot $SDK -fobjc-arc -O2 \
-                  -DNDEBUG -I. -Wno-everything \
-                  -fobjc-runtime=ios-14.0"
-          clang $CFLAGS -dynamiclib \
-            -framework Foundation -framework UIKit \
-            -framework AVFoundation -framework CoreMedia \
-            -framework CoreVideo -framework VideoToolbox \
-            -framework QuartzCore \
+          echo "=== SDK=$SDK ==="
+          mkdir -p out
+          CFLAGS=(
+            -target arm64-ios
+            -isysroot "$SDK"
+            -fobjc-arc
+            -O2
+            -DNDEBUG
+            -I.
+            -Wno-everything
+            -fno-stack-protector
+          )
+          LIBS=(
+            -framework Foundation
+            -framework UIKit
+            -framework AVFoundation
+            -framework CoreMedia
+            -framework CoreVideo
+            -framework VideoToolbox
+            -framework QuartzCore
+            -framework CoreGraphics
+          )
+          set -x
+          zig cc "${CFLAGS[@]}" -dynamiclib \
             -install_name @rpath/VCamLAN.dylib \
             -o VCamLAN.dylib \
-            VCamLANMain.m VCamLANPrefs.m VCamLANHTTPFLVPuller.m 2>&1 | tail -n 80
-          ls -la VCamLAN.dylib || true
+            VCamLANMain.m VCamLANPrefs.m VCamLANHTTPFLVPuller.m \
+            "${LIBS[@]}" 2>&1 | tee /tmp/build.log | tail -n 100
+          set +x
+          echo "=== exit=${PIPESTATUS[0]} ==="
+          ls -la VCamLAN.dylib 2>/dev/null || (echo "!! 没有产物，完整日志见下"; cat /tmp/build.log; exit 1)
 
       - name: Inspect output
         run: |
           set -euo pipefail
-          if [ ! -f VCamLAN.dylib ]; then echo "!! 没产出 VCamLAN.dylib"; ls -la; exit 1; fi
+          if [ ! -f VCamLAN.dylib ]; then echo "!! 没产出"; exit 1; fi
           file VCamLAN.dylib || true
-          (llvm-objdump -p VCamLAN.dylib 2>/dev/null || objdump -p VCamLAN.dylib 2>/dev/null || true) | head -n 40
-          echo "== size =="
           stat -c '%s bytes' VCamLAN.dylib
+          python3 - <<'PY'
+          import struct, sys
+          d = open('VCamLAN.dylib','rb').read()
+          print("magic:", d[:4].hex())
+          if d[:4] == b'\xcf\xfa\xed\xfe':
+              cpu, sub, ft, ncmds, sizeofcmds, flags = struct.unpack_from('<iiIIII', d, 4)
+              print("cputype=0x%x cpusubtype=0x%x filetype=%d ncmds=%d flags=0x%x" % (cpu, sub, ft, ncmds, flags))
+              if cpu != 0x100000c: print("!! cputype 不是 arm64")
+              if ft != 6: print("!! filetype 不是 MH_DYLIB(6)")
+              print("OK: 是 arm64 Mach-O dylib")
+          else:
+              print("!! 不是 Mach-O"); sys.exit(1)
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: VCamLAN.dylib
-          path: |
-            VCamLAN.dylib
-            .theos/obj/**/VCamLAN.dylib
+          path: VCamLAN.dylib
           if-no-files-found: error
           retention-days: 30
