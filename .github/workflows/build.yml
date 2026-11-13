@@ -62,6 +62,9 @@ jobs:
           CFLAGS=(
             -target aarch64-ios
             -isysroot "$SDK"
+            -F"$SDK/System/Library/Frameworks"
+            -L"$SDK/usr/lib"
+            -I"$SDK/usr/include"
             -fobjc-arc
             -O2
             -DNDEBUG
