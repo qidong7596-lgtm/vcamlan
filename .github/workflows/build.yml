@@ -60,7 +60,7 @@ jobs:
           echo "=== SDK=$SDK ==="
           mkdir -p out
           CFLAGS=(
-            -target arm64-ios
+            -target aarch64-ios
             -isysroot "$SDK"
             -fobjc-arc
             -O2
